@@ -73,6 +73,70 @@ async def check_subscription(bot: Bot, sub: dict) -> int:
     return sent_count
 
 
+async def fetch_initial_ads(bot: Bot, sub: dict, limit: int = 10) -> None:
+    """Сразу после создания подписки отправить последние объявления."""
+    try:
+        ads = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: fetch_ads(
+                model=sub["model"],
+                region=sub["region"],
+                price_min=sub["price_min"],
+                price_max=sub["price_max"],
+                max_ads=limit,
+            ),
+        )
+
+        region_name = REGIONS.get(sub["region"], sub["region"])
+        if sub["region"] == ALL_REGIONS_KEY:
+            region_name = ALL_REGIONS_NAME
+
+        if not ads:
+            await bot.send_message(
+                chat_id=sub["user_id"],
+                text=(
+                    "😕 Не удалось загрузить объявления прямо сейчас.\n"
+                    "Бот продолжит мониторинг и пришлёт новые, "
+                    "как только они появятся."
+                ),
+                parse_mode="HTML",
+            )
+            return
+
+        await bot.send_message(
+            chat_id=sub["user_id"],
+            text=(
+                f"📋 <b>Последние {len(ads)} объявлений</b>\n"
+                f"📱 {sub['model']} | 🌍 {region_name}\n"
+                "─────────────────────"
+            ),
+            parse_mode="HTML",
+        )
+
+        sent = 0
+        for ad in ads:
+            if not ad.url:
+                continue
+            db.mark_ad_seen(sub["id"], ad.url)
+            try:
+                await bot.send_message(
+                    chat_id=sub["user_id"],
+                    text=_format_ad(ad),
+                    parse_mode="HTML",
+                    disable_web_page_preview=False,
+                )
+                sent += 1
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.error("Ошибка отправки начального объявления: %s", e)
+
+        logger.info(
+            "Sub #%d: отправлено %d начальных объявлений", sub["id"], sent
+        )
+    except Exception as e:
+        logger.error("Ошибка загрузки начальных объявлений sub #%d: %s", sub["id"], e)
+
+
 async def monitoring_loop(bot: Bot) -> None:
     """Основной цикл мониторинга."""
     logger.info("Мониторинг запущен (интервал: %d сек)", CHECK_INTERVAL)

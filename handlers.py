@@ -1,5 +1,6 @@
 """Обработчики команд и callback-запросов Telegram-бота."""
 
+import asyncio
 import logging
 
 from aiogram import F, Router
@@ -10,6 +11,7 @@ from aiogram.types import CallbackQuery, Message
 
 import database as db
 from config import ALL_REGIONS_KEY, ALL_REGIONS_NAME, REGIONS
+from monitor import fetch_initial_ads
 from keyboards import (
     confirm_keyboard,
     main_menu_keyboard,
@@ -322,11 +324,24 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         f"✅ <b>Подписка #{sub_id} создана!</b>\n\n"
         f"📱 {data['model']} | 🌍 {data['region_name']}\n\n"
-        "Бот начнёт присылать новые объявления в ближайшее время.",
+        "⏳ Загружаю последние объявления...",
         reply_markup=main_menu_keyboard(),
         parse_mode="HTML",
     )
     await callback.answer("Подписка создана!")
+
+    # Сразу отправить 5-10 последних объявлений
+    bot = callback.bot
+    sub = {
+        "id": sub_id,
+        "user_id": callback.from_user.id,
+        "model": data["model"],
+        "region": data["region"],
+        "region_name": data["region_name"],
+        "price_min": data.get("price_min"),
+        "price_max": data.get("price_max"),
+    }
+    asyncio.create_task(fetch_initial_ads(bot, sub))
 
 
 @router.callback_query(F.data == "cancel")

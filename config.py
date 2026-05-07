@@ -6,7 +6,7 @@ import os
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 # Интервал проверки новых объявлений (в секундах)
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 
 # Путь к базе данных
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")

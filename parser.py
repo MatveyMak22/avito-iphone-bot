@@ -1,62 +1,39 @@
-"""Парсер объявлений Авито с обходом блокировки."""
+"""Парсер объявлений Авито с обходом блокировки через curl_cffi."""
 
+import json
 import logging
 import os
 import random
+import re
 import time
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import quote_plus, urlencode
 
-import requests
 from bs4 import BeautifulSoup
+from curl_cffi import requests as curl_requests
 
 logger = logging.getLogger(__name__)
 
 # Прокси (опционально, задаётся через .env)
 PROXY_URL = os.getenv("PROXY_URL", "")
 
-# Актуальные User-Agent строки
-USER_AGENTS = [
-    (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/125.0.0.0 Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/125.0.0.0 Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/125.0.0.0 Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) "
-        "Gecko/20100101 Firefox/126.0"
-    ),
-    (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-        "Version/17.5 Safari/605.1.15"
-    ),
-    (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0"
-    ),
+# Браузерные impersonate-профили для curl_cffi
+BROWSER_PROFILES = [
+    "chrome120",
+    "chrome119",
+    "chrome116",
+    "chrome110",
+    "chrome107",
+    "chrome104",
+    "edge101",
+    "safari17_0",
+    "safari15_5",
 ]
 
-# Глобальная сессия для переиспользования cookies
-_session: Optional[requests.Session] = None
-_session_ua: str = ""
+# Глобальная сессия
+_session: Optional[curl_requests.Session] = None
+_session_profile: str = ""
 
 
 @dataclass
@@ -71,15 +48,15 @@ class Ad:
     image_url: Optional[str] = None
 
 
-def _get_session() -> tuple[requests.Session, str]:
-    """Получить или создать HTTP-сессию с cookies."""
-    global _session, _session_ua
+def _get_session() -> tuple[curl_requests.Session, str]:
+    """Получить или создать HTTP-сессию с TLS-отпечатком браузера."""
+    global _session, _session_profile
 
     if _session is not None:
-        return _session, _session_ua
+        return _session, _session_profile
 
-    _session = requests.Session()
-    _session_ua = random.choice(USER_AGENTS)
+    _session_profile = random.choice(BROWSER_PROFILES)
+    _session = curl_requests.Session(impersonate=_session_profile)
 
     if PROXY_URL:
         _session.proxies = {
@@ -88,46 +65,46 @@ def _get_session() -> tuple[requests.Session, str]:
         }
         logger.info("Используется прокси: %s", PROXY_URL[:30] + "...")
 
-    # Сначала заходим на главную, чтобы получить cookies
-    headers = _make_headers(_session_ua, referer=None)
+    # Заходим на главную, чтобы получить cookies
+    headers = _make_headers(referer=None)
     try:
         resp = _session.get(
             "https://www.avito.ru/", headers=headers, timeout=15
         )
         logger.info(
-            "Инициализация сессии: status=%d, cookies=%d",
+            "Инициализация сессии (%s): status=%d, cookies=%d",
+            _session_profile,
             resp.status_code,
-            len(_session.cookies),
+            len(resp.cookies),
         )
-    except requests.RequestException as e:
+    except Exception as e:
         logger.warning("Не удалось инициализировать сессию: %s", e)
 
-    return _session, _session_ua
+    return _session, _session_profile
 
 
 def reset_session() -> None:
     """Сбросить сессию (при ошибках 429/403)."""
-    global _session, _session_ua
+    global _session, _session_profile
+    if _session is not None:
+        try:
+            _session.close()
+        except Exception:
+            pass
     _session = None
-    _session_ua = ""
+    _session_profile = ""
 
 
-def _make_headers(user_agent: str, referer: Optional[str] = None) -> dict[str, str]:
-    """Заголовки, имитирующие реальный браузер."""
+def _make_headers(referer: Optional[str] = None) -> dict[str, str]:
+    """Минимальные заголовки (TLS-отпечаток уже от curl_cffi)."""
     headers = {
-        "User-Agent": user_agent,
         "Accept": (
             "text/html,application/xhtml+xml,"
             "application/xml;q=0.9,image/avif,image/webp,"
             "image/apng,*/*;q=0.8"
         ),
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
-        "Sec-Ch-Ua": '"Chromium";v="125", "Not.A/Brand";v="24"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "same-origin" if referer else "none",
@@ -169,30 +146,32 @@ def fetch_ads(
     """
     Получить список объявлений с Авито по заданным фильтрам.
 
+    Использует curl_cffi для имитации TLS-отпечатка браузера.
     Поддерживает retry с экспоненциальной задержкой при ошибках 429/403.
     """
     url = _build_search_url(model, region, price_min, price_max)
     logger.info("Запрос: %s", url)
 
     for attempt in range(max_retries):
-        session, ua = _get_session()
+        session, profile = _get_session()
 
-        # Случайная задержка перед запросом (3-7 секунд)
-        delay = random.uniform(3.0, 7.0) + (attempt * 5)
+        # Случайная задержка перед запросом
+        delay = random.uniform(2.0, 5.0) + (attempt * 5)
         time.sleep(delay)
 
         try:
             referer = f"https://www.avito.ru/{region}/telefony"
-            headers = _make_headers(ua, referer=referer)
+            headers = _make_headers(referer=referer)
             response = session.get(url, headers=headers, timeout=20)
 
             if response.status_code == 429:
-                wait_time = (attempt + 1) * 15 + random.uniform(5, 15)
+                wait_time = (attempt + 1) * 20 + random.uniform(5, 15)
                 logger.warning(
-                    "429 Too Many Requests (попытка %d/%d). "
+                    "429 Too Many Requests (попытка %d/%d, профиль: %s). "
                     "Ждём %.0f сек...",
                     attempt + 1,
                     max_retries,
+                    profile,
                     wait_time,
                 )
                 reset_session()
@@ -209,10 +188,20 @@ def fetch_ads(
                 time.sleep(random.uniform(10, 20))
                 continue
 
-            response.raise_for_status()
+            if response.status_code != 200:
+                logger.error("HTTP %d для %s", response.status_code, url)
+                reset_session()
+                continue
+
+            # Сначала пробуем извлечь данные из JSON (embedded в HTML)
+            ads = _parse_json_data(response.text, max_ads)
+            if ads:
+                return ads
+
+            # Фоллбэк — парсинг HTML
             return _parse_html(response.text, max_ads)
 
-        except requests.RequestException as e:
+        except Exception as e:
             logger.error(
                 "Ошибка запроса (попытка %d/%d): %s",
                 attempt + 1,
@@ -227,6 +216,114 @@ def fetch_ads(
     return []
 
 
+def _parse_json_data(html: str, max_ads: int) -> list[Ad]:
+    """Попытка извлечь объявления из JSON-данных, встроенных в HTML."""
+    ads: list[Ad] = []
+
+    # Авито встраивает данные в window.__initialData__ или window.__state__
+    patterns = [
+        r'window\.__initialData__\s*=\s*"(.+?)"\s*;',
+        r'window\.__state__\s*=\s*(\{.+?\})\s*;',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, html, re.DOTALL)
+        if not match:
+            continue
+
+        try:
+            raw = match.group(1)
+            # __initialData__ закодирован как строка
+            if pattern.startswith(r"window\.__initialData__"):
+                raw = raw.encode().decode("unicode_escape")
+            data = json.loads(raw)
+
+            # Ищем items в разных структурах JSON
+            items = _find_items_in_json(data)
+            for item_data in items[:max_ads]:
+                ad = _json_item_to_ad(item_data)
+                if ad:
+                    ads.append(ad)
+
+            if ads:
+                logger.info("Извлечено %d объявлений из JSON", len(ads))
+                return ads
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.debug("Не удалось разобрать JSON: %s", e)
+            continue
+
+    return ads
+
+
+def _find_items_in_json(data: dict) -> list[dict]:
+    """Рекурсивно найти список объявлений в JSON-данных."""
+    if isinstance(data, dict):
+        # Ищем ключи, похожие на списки объявлений
+        for key in ("items", "list", "results", "ads", "catalog"):
+            if key in data and isinstance(data[key], list):
+                return data[key]
+        # Рекурсивный поиск
+        for value in data.values():
+            result = _find_items_in_json(value)
+            if result:
+                return result
+    return []
+
+
+def _json_item_to_ad(item: dict) -> Optional[Ad]:
+    """Конвертировать JSON-элемент в объект Ad."""
+    try:
+        title = item.get("title") or item.get("name", "")
+        if not title:
+            return None
+
+        # Цена
+        price_val = item.get("price") or item.get("priceDetailed", {})
+        if isinstance(price_val, dict):
+            price_str = price_val.get("string") or price_val.get("value", "")
+        elif isinstance(price_val, (int, float)):
+            price_str = f"{int(price_val):,} ₽".replace(",", " ")
+        else:
+            price_str = str(price_val) if price_val else "Цена не указана"
+
+        # URL
+        url_path = item.get("url") or item.get("uri", "")
+        if url_path and not url_path.startswith("http"):
+            url_path = f"https://www.avito.ru{url_path}"
+
+        # Локация
+        location = item.get("location") or item.get("address", "")
+        if isinstance(location, dict):
+            location = location.get("name", "")
+
+        # Дата
+        date = item.get("time") or item.get("date", "")
+        if isinstance(date, dict):
+            date = date.get("relative", "") or date.get("absolute", "")
+
+        # Изображение
+        images = item.get("images") or item.get("photos", [])
+        image_url = None
+        if images and isinstance(images, list):
+            first = images[0]
+            if isinstance(first, str):
+                image_url = first
+            elif isinstance(first, dict):
+                image_url = first.get("url") or first.get("src")
+
+        return Ad(
+            title=title,
+            price=price_str,
+            url=url_path,
+            location=str(location),
+            date=str(date),
+            image_url=image_url,
+        )
+    except Exception as e:
+        logger.debug("Ошибка парсинга JSON-элемента: %s", e)
+        return None
+
+
 def _parse_html(html: str, max_ads: int) -> list[Ad]:
     """Парсинг HTML-страницы выдачи Авито."""
     soup = BeautifulSoup(html, "html.parser")
@@ -235,11 +332,9 @@ def _parse_html(html: str, max_ads: int) -> list[Ad]:
     # Авито использует data-marker="item" для карточек объявлений
     items = soup.find_all("div", {"data-marker": "item"})
     if not items:
-        # Альтернативный селектор — класс iva-item
         items = soup.find_all("div", class_=lambda c: c and "iva-item" in c)
 
     if not items:
-        # Проверим, не получили ли мы страницу с капчей
         page_text = soup.get_text()
         if "captcha" in page_text.lower() or "blocked" in page_text.lower():
             logger.warning("Авито показывает капчу/блокировку")
@@ -259,13 +354,12 @@ def _parse_html(html: str, max_ads: int) -> list[Ad]:
             logger.debug("Не удалось распарсить карточку: %s", e)
             continue
 
-    logger.info("Найдено %d объявлений", len(ads))
+    logger.info("Найдено %d объявлений (HTML)", len(ads))
     return ads
 
 
 def _parse_item(item) -> Optional[Ad]:
     """Извлечь данные из одной карточки объявления."""
-    # Заголовок и ссылка
     title_tag = item.find("a", {"data-marker": "item-title"})
     if not title_tag:
         title_tag = item.find(
@@ -284,7 +378,6 @@ def _parse_item(item) -> Optional[Ad]:
     if href and not href.startswith("http"):
         href = f"https://www.avito.ru{href}"
 
-    # Цена
     price_tag = item.find("meta", {"itemprop": "price"})
     if price_tag:
         price = price_tag.get("content", "")
@@ -297,7 +390,6 @@ def _parse_item(item) -> Optional[Ad]:
         ) or item.find("span", class_=lambda c: c and "price" in c.lower())
         price = price_tag.get_text(strip=True) if price_tag else "Цена не указана"
 
-    # Локация
     location_tag = item.find("div", {"data-marker": "item-address"})
     if not location_tag:
         location_tag = item.find(
@@ -305,7 +397,6 @@ def _parse_item(item) -> Optional[Ad]:
         )
     location = location_tag.get_text(strip=True) if location_tag else ""
 
-    # Дата
     date_tag = item.find("div", {"data-marker": "item-date"})
     if not date_tag:
         date_tag = item.find(
@@ -313,7 +404,6 @@ def _parse_item(item) -> Optional[Ad]:
         )
     date = date_tag.get_text(strip=True) if date_tag else ""
 
-    # Изображение
     img_tag = item.find("img")
     image_url = img_tag.get("src") if img_tag else None
 

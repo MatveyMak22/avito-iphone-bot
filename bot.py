@@ -12,6 +12,7 @@ import database as db
 from config import BOT_TOKEN
 from handlers import router
 from monitor import monitoring_loop
+from parser import close_browser
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,8 +46,14 @@ async def main() -> None:
     asyncio.create_task(monitoring_loop(bot))
     logger.info("Бот запущен!")
 
-    # Запуск polling
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    try:
+        # Запуск polling
+        await dp.start_polling(
+            bot, allowed_updates=dp.resolve_used_update_types()
+        )
+    finally:
+        await close_browser()
+        logger.info("Браузер закрыт.")
 
 
 if __name__ == "__main__":

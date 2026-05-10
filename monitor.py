@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import random
 
 from aiogram import Bot
 
@@ -31,14 +32,11 @@ async def check_subscription(bot: Bot, sub: dict) -> int:
     Проверить одну подписку и отправить новые объявления.
     Возвращает количество отправленных объявлений.
     """
-    ads = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: fetch_ads(
-            model=sub["model"],
-            region=sub["region"],
-            price_min=sub["price_min"],
-            price_max=sub["price_max"],
-        ),
+    ads = await fetch_ads(
+        model=sub["model"],
+        region=sub["region"],
+        price_min=sub["price_min"],
+        price_max=sub["price_max"],
     )
 
     sent_count = 0
@@ -61,7 +59,7 @@ async def check_subscription(bot: Bot, sub: dict) -> int:
                 disable_web_page_preview=False,
             )
             sent_count += 1
-            await asyncio.sleep(0.5)  # Задержка между сообщениями
+            await asyncio.sleep(0.5)
         except Exception as e:
             logger.error(
                 "Ошибка отправки объявления user=%s sub=%s: %s",
@@ -76,15 +74,12 @@ async def check_subscription(bot: Bot, sub: dict) -> int:
 async def fetch_initial_ads(bot: Bot, sub: dict, limit: int = 10) -> None:
     """Сразу после создания подписки отправить последние объявления."""
     try:
-        ads = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: fetch_ads(
-                model=sub["model"],
-                region=sub["region"],
-                price_min=sub["price_min"],
-                price_max=sub["price_max"],
-                max_ads=limit,
-            ),
+        ads = await fetch_ads(
+            model=sub["model"],
+            region=sub["region"],
+            price_min=sub["price_min"],
+            price_max=sub["price_max"],
+            max_ads=limit,
         )
 
         region_name = REGIONS.get(sub["region"], sub["region"])
@@ -155,10 +150,12 @@ async def monitoring_loop(bot: Bot) -> None:
                                 count,
                             )
                     except Exception as e:
-                        logger.error("Ошибка проверки sub #%d: %s", sub["id"], e)
-                    # Пауза между подписками, чтобы не нагружать Авито
-                    await asyncio.sleep(2)
+                        logger.error(
+                            "Ошибка проверки подписки #%d: %s", sub["id"], e
+                        )
+                    # Задержка между подписками
+                    await asyncio.sleep(random.uniform(3, 8))
         except Exception as e:
-            logger.error("Ошибка в цикле мониторинга: %s", e)
+            logger.error("Ошибка цикла мониторинга: %s", e)
 
         await asyncio.sleep(CHECK_INTERVAL)

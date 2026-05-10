@@ -1,39 +1,93 @@
-"""Парсер объявлений Авито с обходом блокировки через curl_cffi."""
+"""Парсер объявлений Авито через Playwright (headless Chrome)."""
 
-import json
+import asyncio
 import logging
 import os
 import random
-import re
-import time
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import quote_plus, urlencode
 
 from bs4 import BeautifulSoup
-from curl_cffi import requests as curl_requests
+from playwright.async_api import (
+    async_playwright,
+    Browser,
+    BrowserContext,
+    Playwright,
+)
 
 logger = logging.getLogger(__name__)
 
-# Прокси (опционально, задаётся через .env)
 PROXY_URL = os.getenv("PROXY_URL", "")
 
-# Браузерные impersonate-профили для curl_cffi
-BROWSER_PROFILES = [
-    "chrome120",
-    "chrome119",
-    "chrome116",
-    "chrome110",
-    "chrome107",
-    "chrome104",
-    "edge101",
-    "safari17_0",
-    "safari15_5",
-]
+# Стелс-скрипт для обхода детекта автоматизации
+_STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
-# Глобальная сессия
-_session: Optional[curl_requests.Session] = None
-_session_profile: str = ""
+window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [
+        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+        { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+        { name: 'Native Client', filename: 'internal-nacl-plugin' },
+    ],
+});
+
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['ru-RU', 'ru', 'en-US', 'en'],
+});
+
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) =>
+    parameters.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : originalQuery(parameters);
+
+Object.defineProperty(navigator, 'platform', {
+    get: () => 'Win32',
+});
+
+Object.defineProperty(navigator, 'hardwareConcurrency', {
+    get: () => 8,
+});
+
+Object.defineProperty(navigator, 'deviceMemory', {
+    get: () => 8,
+});
+
+Object.defineProperty(navigator, 'maxTouchPoints', {
+    get: () => 0,
+});
+"""
+
+# User-Agent-ы реальных браузеров
+_USER_AGENTS = [
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
+        "Gecko/20100101 Firefox/125.0"
+    ),
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+        "Version/17.4 Safari/605.1.15"
+    ),
+]
 
 
 @dataclass
@@ -48,72 +102,107 @@ class Ad:
     image_url: Optional[str] = None
 
 
-def _get_session() -> tuple[curl_requests.Session, str]:
-    """Получить или создать HTTP-сессию с TLS-отпечатком браузера."""
-    global _session, _session_profile
+# ── Глобальный браузер ──────────────────────────────────────────────────────
 
-    if _session is not None:
-        return _session, _session_profile
+_pw: Optional[Playwright] = None
+_browser: Optional[Browser] = None
+_context: Optional[BrowserContext] = None
 
-    _session_profile = random.choice(BROWSER_PROFILES)
-    _session = curl_requests.Session(impersonate=_session_profile)
+
+async def _get_context() -> BrowserContext:
+    """Получить или создать контекст браузера."""
+    global _pw, _browser, _context
+
+    if _context is not None:
+        return _context
+
+    _pw = await async_playwright().start()
+
+    launch_args: dict = {
+        "headless": True,
+        "args": [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--disable-extensions",
+            "--disable-gpu",
+            "--window-size=1920,1080",
+        ],
+    }
 
     if PROXY_URL:
-        _session.proxies = {
-            "http": PROXY_URL,
-            "https": PROXY_URL,
-        }
+        launch_args["proxy"] = {"server": PROXY_URL}
         logger.info("Используется прокси: %s", PROXY_URL[:30] + "...")
 
-    # Заходим на главную, чтобы получить cookies
-    headers = _make_headers(referer=None)
+    _browser = await _pw.chromium.launch(**launch_args)
+
+    ua = random.choice(_USER_AGENTS)
+    _context = await _browser.new_context(
+        viewport={"width": 1920, "height": 1080},
+        user_agent=ua,
+        locale="ru-RU",
+        timezone_id="Europe/Moscow",
+        color_scheme="light",
+        java_script_enabled=True,
+    )
+
+    await _context.add_init_script(_STEALTH_JS)
+
+    # Инициализация: заходим на главную для получения cookies
+    page = await _context.new_page()
     try:
-        resp = _session.get(
-            "https://www.avito.ru/", headers=headers, timeout=15
+        resp = await page.goto(
+            "https://www.avito.ru/",
+            wait_until="domcontentloaded",
+            timeout=30000,
         )
+        status = resp.status if resp else "?"
+        await page.wait_for_timeout(random.randint(2000, 5000))
+        cookies = await _context.cookies()
         logger.info(
-            "Инициализация сессии (%s): status=%d, cookies=%d",
-            _session_profile,
-            resp.status_code,
-            len(resp.cookies),
+            "Браузер инициализирован: status=%s, cookies=%d, ua=%s",
+            status,
+            len(cookies),
+            ua[:50],
         )
     except Exception as e:
-        logger.warning("Не удалось инициализировать сессию: %s", e)
+        logger.warning("Ошибка инициализации браузера: %s", e)
+    finally:
+        await page.close()
 
-    return _session, _session_profile
+    return _context
 
 
-def reset_session() -> None:
-    """Сбросить сессию (при ошибках 429/403)."""
-    global _session, _session_profile
-    if _session is not None:
+async def reset_browser() -> None:
+    """Сбросить браузер (при ошибках 429/403)."""
+    global _pw, _browser, _context
+    if _context:
         try:
-            _session.close()
+            await _context.close()
         except Exception:
             pass
-    _session = None
-    _session_profile = ""
+        _context = None
+    if _browser:
+        try:
+            await _browser.close()
+        except Exception:
+            pass
+        _browser = None
+    if _pw:
+        try:
+            await _pw.stop()
+        except Exception:
+            pass
+        _pw = None
 
 
-def _make_headers(referer: Optional[str] = None) -> dict[str, str]:
-    """Минимальные заголовки (TLS-отпечаток уже от curl_cffi)."""
-    headers = {
-        "Accept": (
-            "text/html,application/xhtml+xml,"
-            "application/xml;q=0.9,image/avif,image/webp,"
-            "image/apng,*/*;q=0.8"
-        ),
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin" if referer else "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
-    }
-    if referer:
-        headers["Referer"] = referer
-    return headers
+async def close_browser() -> None:
+    """Закрыть браузер при завершении работы."""
+    await reset_browser()
+
+
+# ── URL ─────────────────────────────────────────────────────────────────────
 
 
 def _build_search_url(
@@ -135,7 +224,10 @@ def _build_search_url(
     return f"{base}?{urlencode(params, quote_via=quote_plus)}"
 
 
-def fetch_ads(
+# ── Основная функция ────────────────────────────────────────────────────────
+
+
+async def fetch_ads(
     model: str,
     region: str,
     price_min: Optional[int] = None,
@@ -144,62 +236,95 @@ def fetch_ads(
     max_retries: int = 3,
 ) -> list[Ad]:
     """
-    Получить список объявлений с Авито по заданным фильтрам.
+    Получить список объявлений с Авито через Playwright (headless Chrome).
 
-    Использует curl_cffi для имитации TLS-отпечатка браузера.
-    Поддерживает retry с экспоненциальной задержкой при ошибках 429/403.
+    Использует настоящий браузер: выполняет JS, проходит анти-бот-проверки,
+    имеет реальный TLS-отпечаток и fingerprint.
     """
     url = _build_search_url(model, region, price_min, price_max)
     logger.info("Запрос: %s", url)
 
     for attempt in range(max_retries):
-        session, profile = _get_session()
-
-        # Случайная задержка перед запросом
-        delay = random.uniform(2.0, 5.0) + (attempt * 5)
-        time.sleep(delay)
-
+        page = None
         try:
-            referer = f"https://www.avito.ru/{region}/telefony"
-            headers = _make_headers(referer=referer)
-            response = session.get(url, headers=headers, timeout=20)
+            context = await _get_context()
+            page = await context.new_page()
 
-            if response.status_code == 429:
-                wait_time = (attempt + 1) * 20 + random.uniform(5, 15)
+            # Случайная задержка (имитация реального пользователя)
+            await asyncio.sleep(random.uniform(1.5, 4.0) + attempt * 3)
+
+            response = await page.goto(
+                url, wait_until="domcontentloaded", timeout=30000
+            )
+            status = response.status if response else 0
+
+            if status == 429:
+                wait_time = (attempt + 1) * 25 + random.uniform(5, 15)
                 logger.warning(
-                    "429 Too Many Requests (попытка %d/%d, профиль: %s). "
+                    "429 Too Many Requests (попытка %d/%d). "
                     "Ждём %.0f сек...",
                     attempt + 1,
                     max_retries,
-                    profile,
                     wait_time,
                 )
-                reset_session()
-                time.sleep(wait_time)
+                await page.close()
+                page = None
+                await reset_browser()
+                await asyncio.sleep(wait_time)
                 continue
 
-            if response.status_code == 403:
+            if status == 403:
                 logger.warning(
-                    "403 Forbidden (попытка %d/%d). Сбрасываем сессию...",
+                    "403 Forbidden (попытка %d/%d). Сбрасываем...",
                     attempt + 1,
                     max_retries,
                 )
-                reset_session()
-                time.sleep(random.uniform(10, 20))
+                await page.close()
+                page = None
+                await reset_browser()
+                await asyncio.sleep(random.uniform(10, 20))
                 continue
 
-            if response.status_code != 200:
-                logger.error("HTTP %d для %s", response.status_code, url)
-                reset_session()
-                continue
+            # Ждём рендер карточек (Авито подгружает их JS)
+            try:
+                await page.wait_for_selector(
+                    "[data-marker='item']",
+                    timeout=10000,
+                )
+            except Exception:
+                # Может не быть карточек — пробуем альтернативные селекторы
+                try:
+                    await page.wait_for_selector(
+                        "[class*='iva-item']",
+                        timeout=5000,
+                    )
+                except Exception:
+                    pass
 
-            # Сначала пробуем извлечь данные из JSON (embedded в HTML)
-            ads = _parse_json_data(response.text, max_ads)
+            # Скролл вниз для подгрузки lazy-загруженных элементов
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+            await page.wait_for_timeout(random.randint(1000, 2000))
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(random.randint(1000, 2000))
+
+            html = await page.content()
+            await page.close()
+            page = None
+
+            ads = _parse_html(html, max_ads)
             if ads:
+                logger.info("Найдено %d объявлений", len(ads))
                 return ads
 
-            # Фоллбэк — парсинг HTML
-            return _parse_html(response.text, max_ads)
+            logger.warning(
+                "Не найдено объявлений (попытка %d/%d, status=%s)",
+                attempt + 1,
+                max_retries,
+                status,
+            )
+            if attempt < max_retries - 1:
+                await reset_browser()
+                await asyncio.sleep(random.uniform(5, 10))
 
         except Exception as e:
             logger.error(
@@ -208,120 +333,21 @@ def fetch_ads(
                 max_retries,
                 e,
             )
-            reset_session()
+            await reset_browser()
             if attempt < max_retries - 1:
-                time.sleep(random.uniform(5, 10))
+                await asyncio.sleep(random.uniform(5, 10))
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
     logger.error("Все %d попыток неудачны для: %s", max_retries, url)
     return []
 
 
-def _parse_json_data(html: str, max_ads: int) -> list[Ad]:
-    """Попытка извлечь объявления из JSON-данных, встроенных в HTML."""
-    ads: list[Ad] = []
-
-    # Авито встраивает данные в window.__initialData__ или window.__state__
-    patterns = [
-        r'window\.__initialData__\s*=\s*"(.+?)"\s*;',
-        r'window\.__state__\s*=\s*(\{.+?\})\s*;',
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, html, re.DOTALL)
-        if not match:
-            continue
-
-        try:
-            raw = match.group(1)
-            # __initialData__ закодирован как строка
-            if pattern.startswith(r"window\.__initialData__"):
-                raw = raw.encode().decode("unicode_escape")
-            data = json.loads(raw)
-
-            # Ищем items в разных структурах JSON
-            items = _find_items_in_json(data)
-            for item_data in items[:max_ads]:
-                ad = _json_item_to_ad(item_data)
-                if ad:
-                    ads.append(ad)
-
-            if ads:
-                logger.info("Извлечено %d объявлений из JSON", len(ads))
-                return ads
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            logger.debug("Не удалось разобрать JSON: %s", e)
-            continue
-
-    return ads
-
-
-def _find_items_in_json(data: dict) -> list[dict]:
-    """Рекурсивно найти список объявлений в JSON-данных."""
-    if isinstance(data, dict):
-        # Ищем ключи, похожие на списки объявлений
-        for key in ("items", "list", "results", "ads", "catalog"):
-            if key in data and isinstance(data[key], list):
-                return data[key]
-        # Рекурсивный поиск
-        for value in data.values():
-            result = _find_items_in_json(value)
-            if result:
-                return result
-    return []
-
-
-def _json_item_to_ad(item: dict) -> Optional[Ad]:
-    """Конвертировать JSON-элемент в объект Ad."""
-    try:
-        title = item.get("title") or item.get("name", "")
-        if not title:
-            return None
-
-        # Цена
-        price_val = item.get("price") or item.get("priceDetailed", {})
-        if isinstance(price_val, dict):
-            price_str = price_val.get("string") or price_val.get("value", "")
-        elif isinstance(price_val, (int, float)):
-            price_str = f"{int(price_val):,} ₽".replace(",", " ")
-        else:
-            price_str = str(price_val) if price_val else "Цена не указана"
-
-        # URL
-        url_path = item.get("url") or item.get("uri", "")
-        if url_path and not url_path.startswith("http"):
-            url_path = f"https://www.avito.ru{url_path}"
-
-        # Локация
-        location = item.get("location") or item.get("address", "")
-        if isinstance(location, dict):
-            location = location.get("name", "")
-
-        # Дата
-        date = item.get("time") or item.get("date", "")
-        if isinstance(date, dict):
-            date = date.get("relative", "") or date.get("absolute", "")
-
-        # Изображение
-        images = item.get("images") or item.get("photos", [])
-        image_url = None
-        if images and isinstance(images, list):
-            first = images[0]
-            if isinstance(first, str):
-                image_url = first
-            elif isinstance(first, dict):
-                image_url = first.get("url") or first.get("src")
-
-        return Ad(
-            title=title,
-            price=price_str,
-            url=url_path,
-            location=str(location),
-            date=str(date),
-            image_url=image_url,
-        )
-    except Exception as e:
-        logger.debug("Ошибка парсинга JSON-элемента: %s", e)
-        return None
+# ── HTML-парсинг ────────────────────────────────────────────────────────────
 
 
 def _parse_html(html: str, max_ads: int) -> list[Ad]:
@@ -329,7 +355,6 @@ def _parse_html(html: str, max_ads: int) -> list[Ad]:
     soup = BeautifulSoup(html, "html.parser")
     ads: list[Ad] = []
 
-    # Авито использует data-marker="item" для карточек объявлений
     items = soup.find_all("div", {"data-marker": "item"})
     if not items:
         items = soup.find_all("div", class_=lambda c: c and "iva-item" in c)
@@ -338,7 +363,6 @@ def _parse_html(html: str, max_ads: int) -> list[Ad]:
         page_text = soup.get_text()
         if "captcha" in page_text.lower() or "blocked" in page_text.lower():
             logger.warning("Авито показывает капчу/блокировку")
-            reset_session()
         else:
             logger.warning(
                 "Не найдено карточек объявлений (HTML: %d символов)",
@@ -354,7 +378,6 @@ def _parse_html(html: str, max_ads: int) -> list[Ad]:
             logger.debug("Не удалось распарсить карточку: %s", e)
             continue
 
-    logger.info("Найдено %d объявлений (HTML)", len(ads))
     return ads
 
 
@@ -388,7 +411,9 @@ def _parse_item(item) -> Optional[Ad]:
         price_tag = item.find(
             "span", {"data-marker": "item-price"}
         ) or item.find("span", class_=lambda c: c and "price" in c.lower())
-        price = price_tag.get_text(strip=True) if price_tag else "Цена не указана"
+        price = (
+            price_tag.get_text(strip=True) if price_tag else "Цена не указана"
+        )
 
     location_tag = item.find("div", {"data-marker": "item-address"})
     if not location_tag:
